@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -87,6 +88,8 @@ func main() {
 
 	// Benchmark tool calls with all users in parallel
 	var allLatencies []time.Duration
+	var successfulRequests atomic.Int64
+	var failedRequests atomic.Int64
 	var mu sync.Mutex
 	benchStart := time.Now()
 
@@ -106,9 +109,11 @@ func main() {
 				latency, err := measureRequest(client, req)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "user %d request %d: %v\n", userIdx, j, err)
+					failedRequests.Add(1)
 					continue
 				}
 				localLatencies = append(localLatencies, latency)
+				successfulRequests.Add(1)
 			}
 
 			mu.Lock()
@@ -150,6 +155,14 @@ func main() {
 	fmt.Printf("P99 latency: %v\n", percentile(allLatencies, 99))
 	fmt.Printf("RPS (individual): %.2f\n", rps)
 	fmt.Printf("RPS (throughput): %.2f\n", throughputRps)
+	fmt.Printf("\nRequests:\n")
+	fmt.Printf("  Successful: %d\n", successfulRequests.Load())
+	fmt.Printf("  Failed: %d\n", failedRequests.Load())
+	successRate := 0.0
+	if totalRuns > 0 {
+		successRate = float64(successfulRequests.Load()) / float64(totalRuns) * 100.0
+	}
+	fmt.Printf("  Success Rate: %.2f%%\n", successRate)
 }
 
 func measureRequest(client *http.Client, req *http.Request) (time.Duration, error) {

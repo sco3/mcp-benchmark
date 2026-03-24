@@ -3,6 +3,10 @@ name = "test-with-rust"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "test-with-rust-script"
+path = "test-with-rust.rs"
+
 [dependencies]
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
 clap = { version = "4", features = ["derive"] }
