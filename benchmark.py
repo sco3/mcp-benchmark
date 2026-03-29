@@ -3,6 +3,13 @@
 MCP Streamable HTTP benchmark (Python).
 
 Matches the Go benchmark: Init, Tool/list, Tool call phases and sdk-style output.
+
+Concurrency: one OS process per virtual user (`-u`). Each process runs its own
+`asyncio.run()` for MCP async I/O. Phases 2 and 3 share one MCP session per process
+(list_tools then call_tool). A multiprocessing.Barrier cannot be passed through
+`multiprocessing.Pool` with "spawn", so global "all lists before any calls" ordering
+matches Go only when using a single event loop; with processes, each worker runs
+list then call sequentially on its session.
 """
 
 from __future__ import annotations
@@ -11,10 +18,10 @@ import argparse
 import asyncio
 import json
 import logging
+import multiprocessing as mp
 import os
 import sys
 import time
-from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -203,11 +210,24 @@ async def user_init_benchmark(
     return successes, failures, latencies_ms
 
 
-async def run_init_phase(
+def _phase1_process_worker(
+    server_url: str,
+    init_runs: int,
+    http_headers: dict[str, str],
+) -> tuple[int, int, list[float]]:
+    """Runs in child process: one client’s init phase."""
+    async def _run() -> tuple[int, int, list[float]]:
+        async with make_http_client(http_headers) as http_client:
+            return await user_init_benchmark(server_url, init_runs, http_client)
+
+    return asyncio.run(_run())
+
+
+def run_phase1_multiprocess(
     server_url: str,
     users: int,
     init_runs: int,
-    http_client: httpx.AsyncClient,
+    http_headers: dict[str, str],
 ) -> PhaseStats:
     total_requests = users * init_runs
     print(
@@ -215,14 +235,13 @@ async def run_init_phase(
         f"{total_requests} total requests"
     )
     print(f"   Server: {server_url}")
+    print(f"   Concurrency: {users} processes (one per client)")
+
+    args = [(server_url, init_runs, dict(http_headers)) for _ in range(users)]
 
     bench_start = time.perf_counter()
-    results = await asyncio.gather(
-        *[
-            user_init_benchmark(server_url, init_runs, http_client)
-            for _ in range(users)
-        ]
-    )
+    with mp.Pool(processes=users) as pool:
+        results = pool.starmap(_phase1_process_worker, args)
     elapsed_s = time.perf_counter() - bench_start
 
     successes = sum(r[0] for r in results)
@@ -241,124 +260,196 @@ async def run_init_phase(
     )
 
 
-async def user_list_tools(
-    session: ClientSession,
-    init_runs: int,
-) -> tuple[int, int, list[float]]:
-    successes = 0
-    failures = 0
-    latencies_ms: list[float] = []
-    for _ in range(init_runs):
-        t0 = time.perf_counter()
-        try:
-            await session.list_tools()
-            latencies_ms.append((time.perf_counter() - t0) * 1000.0)
-            successes += 1
-        except Exception:
-            failures += 1
-    return successes, failures, latencies_ms
-
-
-async def run_list_phase(
-    sessions: list[ClientSession],
-    init_runs: int,
+async def _user_list_and_call_async(
     server_url: str,
-) -> PhaseStats:
-    users = len(sessions)
-    total_requests = users * init_runs
+    init_runs: int,
+    runs: int,
+    tool_name: str,
+    tool_arguments: dict[str, Any] | None,
+    http_client: httpx.AsyncClient,
+) -> tuple[
+    tuple[int, int, list[float]],
+    tuple[int, int, list[float]],
+    float,
+    float,
+]:
+    """One session: list_tools x init_runs, then call_tool x runs (same connection)."""
+    list_success = 0
+    list_fail = 0
+    list_latencies: list[float] = []
+    call_success = 0
+    call_fail = 0
+    call_latencies: list[float] = []
+
+    async with streamable_http_client(server_url, http_client=http_client) as (
+        read_stream,
+        write_stream,
+        _,
+    ):
+        async with ClientSession(
+            read_stream,
+            write_stream,
+            client_info=CLIENT_INFO,
+        ) as session:
+            s = cast(ClientSession, session)
+            await s.initialize()
+
+            t_list0 = time.perf_counter()
+            for _ in range(init_runs):
+                t0 = time.perf_counter()
+                try:
+                    await s.list_tools()
+                    list_latencies.append((time.perf_counter() - t0) * 1000.0)
+                    list_success += 1
+                except Exception:
+                    list_fail += 1
+            t_list1 = time.perf_counter()
+            list_elapsed = t_list1 - t_list0
+
+            t_call0 = time.perf_counter()
+            for _ in range(runs):
+                t0 = time.perf_counter()
+                try:
+                    await s.call_tool(tool_name, tool_arguments)
+                    call_latencies.append((time.perf_counter() - t0) * 1000.0)
+                    call_success += 1
+                except Exception:
+                    call_fail += 1
+            t_call1 = time.perf_counter()
+            call_elapsed = t_call1 - t_call0
+
+    return (
+        (list_success, list_fail, list_latencies),
+        (call_success, call_fail, call_latencies),
+        list_elapsed,
+        call_elapsed,
+    )
+
+
+def _phase23_process_worker(
+    server_url: str,
+    init_runs: int,
+    runs: int,
+    tool_name: str,
+    tool_arguments: dict[str, Any] | None,
+    http_headers: dict[str, str],
+) -> tuple[
+    tuple[int, int, list[float]],
+    tuple[int, int, list[float]],
+    float,
+    float,
+]:
+    """Runs in child process: one session, list phase then call phase."""
+    async def _run() -> tuple[
+        tuple[int, int, list[float]],
+        tuple[int, int, list[float]],
+        float,
+        float,
+    ]:
+        async with make_http_client(http_headers) as http_client:
+            return await _user_list_and_call_async(
+                server_url,
+                init_runs,
+                runs,
+                tool_name,
+                tool_arguments,
+                http_client,
+            )
+
+    return asyncio.run(_run())
+
+
+def run_phase23_multiprocess(
+    server_url: str,
+    users: int,
+    init_runs: int,
+    runs: int,
+    tool_name: str,
+    tool_arguments: dict[str, Any] | None,
+    http_headers: dict[str, str],
+    args_json: str,
+) -> tuple[PhaseStats, PhaseStats]:
+    list_total = users * init_runs
+    call_total = users * runs
+
     print(
         f"\n🚀 Phase 2 - Tool/list Benchmark: {users} clients × {init_runs} runs = "
-        f"{total_requests} total requests"
+        f"{list_total} total requests"
     )
     print(f"   Server: {server_url}")
 
-    bench_start = time.perf_counter()
-    results = await asyncio.gather(
-        *[user_list_tools(s, init_runs) for s in sessions]
-    )
-    elapsed_s = time.perf_counter() - bench_start
-
-    successes = sum(r[0] for r in results)
-    failures = sum(r[1] for r in results)
-    latencies: list[float] = []
-    for r in results:
-        latencies.extend(r[2])
-
-    return PhaseStats(
-        name="Tool/list",
-        total_requests=total_requests,
-        successful_requests=successes,
-        failed_requests=failures,
-        latencies_ms=latencies,
-        elapsed_s=elapsed_s,
-    )
-
-
-async def user_tool_calls(
-    session: ClientSession,
-    tool_name: str,
-    tool_arguments: dict[str, Any] | None,
-    runs: int,
-) -> tuple[int, int, list[float]]:
-    successes = 0
-    failures = 0
-    latencies_ms: list[float] = []
-    for _ in range(runs):
-        t0 = time.perf_counter()
-        try:
-            await session.call_tool(tool_name, tool_arguments)
-            latencies_ms.append((time.perf_counter() - t0) * 1000.0)
-            successes += 1
-        except Exception:
-            failures += 1
-    return successes, failures, latencies_ms
-
-
-async def run_tool_call_phase(
-    sessions: list[ClientSession],
-    tool_name: str,
-    tool_arguments: dict[str, Any] | None,
-    runs: int,
-    server_url: str,
-    args_json: str,
-) -> PhaseStats:
-    users = len(sessions)
-    total_requests = users * runs
     print(
         f"\n🚀 Phase 3 - Tool Call Benchmark: {users} clients × {runs} runs = "
-        f"{total_requests} total requests"
+        f"{call_total} total requests"
     )
     print(f"   Server: {server_url}")
     print(f"   Tool: {tool_name}")
     if args_json:
         print(f"   Arguments: {args_json}")
+    print(f"   Concurrency: {users} processes (one per client)")
+
+    args = [
+        (
+            server_url,
+            init_runs,
+            runs,
+            tool_name,
+            tool_arguments,
+            dict(http_headers),
+        )
+        for _ in range(users)
+    ]
 
     bench_start = time.perf_counter()
-    results = await asyncio.gather(
-        *[
-            user_tool_calls(s, tool_name, tool_arguments, runs)
-            for s in sessions
-        ]
-    )
-    elapsed_s = time.perf_counter() - bench_start
+    with mp.Pool(processes=users) as pool:
+        results = pool.starmap(_phase23_process_worker, args)
+    bench_end = time.perf_counter()
 
-    successes = sum(r[0] for r in results)
-    failures = sum(r[1] for r in results)
-    latencies: list[float] = []
+    list_section_times: list[float] = []
+    call_section_times: list[float] = []
+    ls_succ = lf = 0
+    list_latencies: list[float] = []
+    cs_succ = cf = 0
+    call_latencies: list[float] = []
+
     for r in results:
-        latencies.extend(r[2])
+        (a0, a1, la), (b0, b1, ca), list_elapsed, call_elapsed = r
+        ls_succ += a0
+        lf += a1
+        list_latencies.extend(la)
+        cs_succ += b0
+        cf += b1
+        call_latencies.extend(ca)
+        list_section_times.append(list_elapsed)
+        call_section_times.append(call_elapsed)
 
-    return PhaseStats(
-        name="Tool call",
-        total_requests=total_requests,
-        successful_requests=successes,
-        failed_requests=failures,
-        latencies_ms=latencies,
-        elapsed_s=elapsed_s,
+    list_elapsed_s = max(list_section_times) if list_section_times else 0.0
+    call_elapsed_s = max(call_section_times) if call_section_times else 0.0
+    if list_elapsed_s <= 0.0:
+        list_elapsed_s = bench_end - bench_start
+    if call_elapsed_s <= 0.0:
+        call_elapsed_s = bench_end - bench_start
+
+    list_stats = PhaseStats(
+        name="Tool/list",
+        total_requests=list_total,
+        successful_requests=ls_succ,
+        failed_requests=lf,
+        latencies_ms=list_latencies,
+        elapsed_s=list_elapsed_s,
     )
+    call_stats = PhaseStats(
+        name="Tool call",
+        total_requests=call_total,
+        successful_requests=cs_succ,
+        failed_requests=cf,
+        latencies_ms=call_latencies,
+        elapsed_s=call_elapsed_s,
+    )
+    return list_stats, call_stats
 
 
-async def async_main(
+def run_benchmark(
     server_url: str,
     users: int,
     init_runs: int,
@@ -368,29 +459,6 @@ async def async_main(
     args_json: str,
     http_headers: dict[str, str],
 ) -> None:
-    async with make_http_client(http_headers) as http_client:
-        await _async_main_inner(
-            server_url,
-            users,
-            init_runs,
-            tool_runs,
-            tool_name,
-            tool_arguments,
-            args_json,
-            http_client,
-        )
-
-
-async def _async_main_inner(
-    server_url: str,
-    users: int,
-    init_runs: int,
-    tool_runs: int,
-    tool_name: str,
-    tool_arguments: dict[str, Any] | None,
-    args_json: str,
-    http_client: httpx.AsyncClient,
-) -> None:
     print("🔌 MCP Streamable HTTP Benchmark")
     print("   Transport: Streamable HTTP")
     print(
@@ -399,47 +467,38 @@ async def _async_main_inner(
     print(f"   Server: {server_url}")
 
     print(f"   Verifying tool '{tool_name}' exists...")
-    await verify_tool_exists(server_url, tool_name, http_client)
+
+    async def _verify() -> None:
+        async with make_http_client(http_headers) as http_client:
+            await verify_tool_exists(server_url, tool_name, http_client)
+
+    asyncio.run(_verify())
     print(f"   ✅ Tool '{tool_name}' found")
 
-    init_stats = await run_init_phase(server_url, users, init_runs, http_client)
+    init_stats = run_phase1_multiprocess(server_url, users, init_runs, http_headers)
     init_stats.print_results()
 
-    async with AsyncExitStack() as stack:
-        sessions: list[ClientSession] = []
-        for _ in range(users):
-            read_stream, write_stream, _ = await stack.enter_async_context(
-                streamable_http_client(server_url, http_client=http_client)
-            )
-            session = ClientSession(
-                read_stream,
-                write_stream,
-                client_info=CLIENT_INFO,
-            )
-            s = cast(
-                ClientSession,
-                await stack.enter_async_context(session),
-            )
-            await s.initialize()
-            sessions.append(s)
-
-        list_stats = await run_list_phase(sessions, init_runs, server_url)
-        list_stats.print_results()
-
-        call_stats = await run_tool_call_phase(
-            sessions,
-            tool_name,
-            tool_arguments,
-            tool_runs,
-            server_url,
-            args_json,
-        )
-        call_stats.print_results()
-
-        print_summary(init_stats, list_stats, call_stats)
+    list_stats, call_stats = run_phase23_multiprocess(
+        server_url,
+        users,
+        init_runs,
+        tool_runs,
+        tool_name,
+        tool_arguments,
+        http_headers,
+        args_json,
+    )
+    list_stats.print_results()
+    call_stats.print_results()
+    print_summary(init_stats, list_stats, call_stats)
 
 
 def main() -> None:
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass  # already set (e.g. tests / embedding)
+
     parser = argparse.ArgumentParser(
         description="MCP Streamable HTTP benchmark (matches Go / sdk-benchmark output)"
     )
@@ -469,7 +528,7 @@ def main() -> None:
         "--users",
         type=int,
         default=1,
-        help="Number of concurrent clients",
+        help="Number of concurrent clients (processes)",
     )
     parser.add_argument(
         "-t",
@@ -533,17 +592,15 @@ def main() -> None:
 
     http_headers = merge_http_headers(cli_headers, auth_token)
 
-    asyncio.run(
-        async_main(
-            server_url=server_url,
-            users=users,
-            init_runs=init_runs,
-            tool_runs=runs,
-            tool_name=tool_name,
-            tool_arguments=tool_arguments,
-            args_json=args_json,
-            http_headers=http_headers,
-        )
+    run_benchmark(
+        server_url=server_url,
+        users=users,
+        init_runs=init_runs,
+        tool_runs=runs,
+        tool_name=tool_name,
+        tool_arguments=tool_arguments,
+        args_json=args_json,
+        http_headers=http_headers,
     )
 
 
