@@ -1,4 +1,1 @@
-.venv
-target
-__pycache__/
-gomcp-benchmark
+Nothing should be ignored based on the provided file changes. The only modified file is 'benchmark.py', which is a source code file and should not be added to .gitignore.
