@@ -1,5 +1,5 @@
 [package]
-name = "mcp-benchmark"
+name = "sdk-benchmark"
 version = "0.1.0"
 edition = "2021"
 
