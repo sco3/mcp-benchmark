@@ -242,14 +242,9 @@ async fn run_tool_call_benchmark(
         let arguments = arguments.clone();
 
         tasks.spawn(async move {
-            let client_stats = benchmark_tool_call(
-                client_id,
-                server_url,
-                runs_per_client,
-                tool_name,
-                arguments,
-            )
-            .await;
+            let client_stats =
+                benchmark_tool_call(client_id, server_url, runs_per_client, tool_name, arguments)
+                    .await;
 
             let mut stats = stats_clone.lock().await;
             stats.total_requests += client_stats.total_requests;
@@ -271,11 +266,7 @@ async fn run_tool_call_benchmark(
     final_stats.clone()
 }
 
-async fn benchmark_init(
-    client_id: usize,
-    base_url: String,
-    num_requests: usize,
-) -> BenchmarkStats {
+async fn benchmark_init(client_id: usize, base_url: String, num_requests: usize) -> BenchmarkStats {
     let mut stats = BenchmarkStats::new();
 
     for i in 0..num_requests {
@@ -349,8 +340,10 @@ async fn benchmark_list_tools(
             }
         }
 
+        let elapsed = start.elapsed();
+        eprintln!("   [list] Request {}: {:.3}ms", i + 1, elapsed.as_secs_f64() * 1000.0);
         stats.total_requests += 1;
-        stats.total_latency += start.elapsed();
+        stats.total_latency += elapsed;
     }
 
     stats
@@ -398,13 +391,17 @@ async fn benchmark_tool_call(
                     stats.failed_requests += 1;
                     if i == 0 {
                         // Extract error message from content
-                        let error_msg = result.content.iter().find_map(|c| {
-                            if let RawContent::Text(text) = &**c {
-                                Some(text.text.clone())
-                            } else {
-                                None
-                            }
-                        }).unwrap_or_else(|| "Tool call failed".to_string());
+                        let error_msg = result
+                            .content
+                            .iter()
+                            .find_map(|c| {
+                                if let RawContent::Text(text) = &**c {
+                                    Some(text.text.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| "Tool call failed".to_string());
                         eprintln!("   Client {} tool error: {}", client_id, error_msg);
                     }
                 } else if !result.content.is_empty() {
@@ -424,8 +421,10 @@ async fn benchmark_tool_call(
             }
         }
 
+        let elapsed = start.elapsed();
+        //eprintln!("   [tool] Request {}: {:.3}ms", i + 1, elapsed.as_secs_f64() * 1000.0);
         stats.total_requests += 1;
-        stats.total_latency += start.elapsed();
+        stats.total_latency += elapsed;
     }
 
     stats
@@ -481,7 +480,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("🔌 MCP Streamable HTTP Benchmark");
     println!("   Transport: Streamable HTTP");
-    println!("   Users: {}, Init runs: {}, Tool call runs: {}", args.users, init_runs, args.runs);
+    println!(
+        "   Users: {}, Init runs: {}, Tool call runs: {}",
+        args.users, init_runs, args.runs
+    );
     println!("   Server: {}", args.server_url);
 
     // Parse JSON arguments if provided
@@ -496,9 +498,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match value {
             Value::Object(_) => Some(value),
             _ => {
-                return Err(
-                    "JSON arguments must be an object (e.g., {\"key\": \"value\"})".into(),
-                )
+                return Err("JSON arguments must be an object (e.g., {\"key\": \"value\"})".into())
             }
         }
     };
@@ -529,9 +529,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Summary
     println!("\n📈 Summary:");
-    println!("   Init:      {:.2} req/s,  {:.2}ms avg latency", init_stats.throughput(), init_stats.avg_latency_ms());
-    println!("   Tool/list: {:.2} req/s,  {:.2}ms avg latency", list_stats.throughput(), list_stats.avg_latency_ms());
-    println!("   Tool call: {:.2} req/s,  {:.2}ms avg latency", tool_call_stats.throughput(), tool_call_stats.avg_latency_ms());
+    println!(
+        "   Init:      {:.2} req/s,  {:.2}ms avg latency",
+        init_stats.throughput(),
+        init_stats.avg_latency_ms()
+    );
+    println!(
+        "   Tool/list: {:.2} req/s,  {:.2}ms avg latency",
+        list_stats.throughput(),
+        list_stats.avg_latency_ms()
+    );
+    println!(
+        "   Tool call: {:.2} req/s,  {:.2}ms avg latency",
+        tool_call_stats.throughput(),
+        tool_call_stats.avg_latency_ms()
+    );
 
     Ok(())
 }

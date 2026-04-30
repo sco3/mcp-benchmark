@@ -179,14 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.users * init_runs
     );
     println!("   Server: {}", args.server_url);
-    let list_phase = run_list_phase(
-        &client,
-        url,
-        &base_headers,
-        &sessions,
-        list_req,
-        init_runs,
-    )?;
+    let list_phase = run_list_phase(&client, url, &base_headers, &sessions, list_req, init_runs)?;
     list_phase.print_results();
 
     // Phase 3: Tool call benchmark (reuse sessions)
@@ -198,14 +191,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("   Server: {}", args.server_url);
     println!("   Tool: {}", args.tool_name);
-    let tool_call_phase = run_tool_call_phase(
-        &client,
-        url,
-        &base_headers,
-        &sessions,
-        &call_req,
-        args.runs,
-    )?;
+    let tool_call_phase =
+        run_tool_call_phase(&client, url, &base_headers, &sessions, &call_req, args.runs)?;
     tool_call_phase.print_results();
 
     println!("\n📈 Summary:");
@@ -243,7 +230,11 @@ fn verify_tool_exists(
     let mut headers = base_headers.clone();
     headers.insert("Mcp-Session-Id", HeaderValue::from_str(session_id)?);
 
-    let resp = client.post(url).body(list_req.to_string()).headers(headers).send()?;
+    let resp = client
+        .post(url)
+        .body(list_req.to_string())
+        .headers(headers)
+        .send()?;
     let body = resp.text()?;
 
     // Best-effort match: rmcp/go servers typically include tool names in JSON content.
