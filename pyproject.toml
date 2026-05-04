@@ -13,7 +13,7 @@ dependencies = [
 [project.scripts]
 test-mcp = "client:main"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.0.0",
 ]

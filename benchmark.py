@@ -1,251 +1,836 @@
 #!/usr/bin/env python3
 """
-MCP Server Benchmark Tool
+MCP Streamable HTTP benchmark (Python).
 
-Runs concurrent benchmark tests against an MCP server using multiprocessing.
-Each virtual user runs in its own Python process.
+Concurrency: one OS process per virtual user (`-u`). Each process runs its own
+`asyncio.run()` for MCP async I/O.
+
+Scenario: Cyclic benchmark where each cycle is:
+  1 session.init() -> 1 list_tools() -> N call_tool() (default N=100)
+Cycles repeat until total call_tool count reaches the configured (-r) runs.
+
+Use --calls-per-cycle to configure N (default: 100).
 """
 
+from __future__ import annotations
+
 import argparse
+import asyncio
 import json
 import logging
 import multiprocessing as mp
+import os
+import sys
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
-import anyio
+import httpx
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
+from mcp.shared._httpx_utils import create_mcp_http_client
+
+# Default timeout values for MCP HTTP client
+MCP_DEFAULT_TIMEOUT = 30.0
+MCP_DEFAULT_SSE_READ_TIMEOUT = 60.0
+
 from mcp.types import Implementation
 
-# Suppress MCP client transport warnings (e.g., 202 Accepted for session termination)
-logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
+# The MCP streamable HTTP transport logs logger.exception("Error in post_writer") on failures,
+# which spams tracebacks to stderr. Silence that logger; benchmark code reports errors via stats.
+_log_mcp_http = logging.getLogger("mcp.client.streamable_http")
+_log_mcp_http.setLevel(logging.CRITICAL)
+_log_mcp_http.propagate = False
+
+CLIENT_INFO = Implementation(name="demo", version="0.0.1")
+
+
+def parse_header_args(header_parts: list[str]) -> dict[str, str]:
+    """Parse -H 'Name: value' or -H 'Name=value' into a header dict."""
+    out: dict[str, str] = {}
+    for part in header_parts:
+        if ":" in part:
+            key, value = part.split(":", 1)
+        elif "=" in part:
+            key, value = part.split("=", 1)
+        else:
+            continue
+        out[key.strip()] = value.strip()
+    return out
+
+
+def merge_http_headers(
+    cli_headers: list[str],
+    auth_token: str | None,
+) -> dict[str, str]:
+    headers = parse_header_args(cli_headers)
+
+    if auth_token:
+        headers.setdefault("Authorization", f"Bearer {auth_token}")
+
+    env_auth = os.environ.get("MCP_AUTHORIZATION") or os.environ.get("AUTHORIZATION")
+    if env_auth and "Authorization" not in headers:
+        headers["Authorization"] = env_auth.strip()
+
+    env_bearer = os.environ.get("MCP_AUTH_TOKEN") or os.environ.get("MCP_BEARER_TOKEN")
+    if env_bearer and "Authorization" not in headers:
+        headers["Authorization"] = f"Bearer {env_bearer.strip()}"
+
+    return headers
+
+
+def make_http_client(headers: dict[str, str]) -> httpx.AsyncClient:
+    timeout = httpx.Timeout(MCP_DEFAULT_TIMEOUT, read=MCP_DEFAULT_SSE_READ_TIMEOUT)
+    return create_mcp_http_client(headers=headers or None, timeout=timeout)
+
+
+def _is_unauthorized(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 401:
+        return True
+    msg = str(exc).lower()
+    return "401" in msg or "unauthorized" in msg
 
 
 @dataclass
-class BenchmarkResult:
-    """Results from a single virtual user's benchmark run."""
-
-    user_id: int
+class PhaseStats:
+    name: str
     total_requests: int
     successful_requests: int
     failed_requests: int
-    total_latency_ms: float
-    min_latency_ms: float
-    max_latency_ms: float
-    latencies: list[float]
-    last_result: Any = None
+    latencies_ms: list[float]
+    elapsed_s: float
+
+    def avg_latency_ms(self) -> float:
+        if self.successful_requests <= 0:
+            return 0.0
+        return sum(self.latencies_ms) / self.successful_requests
+
+    def throughput(self) -> float:
+        if self.elapsed_s <= 0:
+            return 0.0
+        return self.successful_requests / self.elapsed_s
+
+    def print_results(self) -> None:
+        print(f"\n=== {self.name} Results:")
+        print(
+            f"   Total: {self.total_requests} requests "
+            f"({self.successful_requests} success, {self.failed_requests} failed)"
+        )
+        print(f"   Elapsed: {self.elapsed_s:.2f}s")
+        print(f"   Avg latency: {self.avg_latency_ms():.2f}ms")
+        print(f"   Throughput: {self.throughput():.2f} req/s")
 
 
-def run_user_benchmark(
-    user_id: int,
+@dataclass
+class CyclicStats:
+    """Stats for the cyclic benchmark scenario."""
+    total_cycles: int
+    total_inits: int
+    total_lists: int
+    total_calls: int
+    init_success: int
+    init_fail: int
+    list_success: int
+    list_fail: int
+    call_success: int
+    call_fail: int
+    init_latencies_ms: list[float]
+    list_latencies_ms: list[float]
+    call_latencies_ms: list[float]
+    elapsed_s: float
+
+    def print_results(self) -> None:
+        print(f"\n=== Cyclic Benchmark Results:")
+        print(f"   Total cycles: {self.total_cycles}")
+        print(f"   Total operations: {self.total_inits} inits, {self.total_lists} lists, {self.total_calls} calls")
+        print(f"   Elapsed: {self.elapsed_s:.2f}s")
+        print()
+        print("   Init stats:")
+        print(f"      {self.init_success} success, {self.init_fail} failed")
+        if self.init_success > 0:
+            avg = sum(self.init_latencies_ms) / len(self.init_latencies_ms)
+            print(f"      Avg latency: {avg:.2f}ms")
+            print(f"      Throughput: {self.init_success / self.elapsed_s:.2f} req/s")
+        print()
+        print("   Tool/list stats:")
+        print(f"      {self.list_success} success, {self.list_fail} failed")
+        if self.list_success > 0:
+            avg = sum(self.list_latencies_ms) / len(self.list_latencies_ms)
+            print(f"      Avg latency: {avg:.2f}ms")
+            print(f"      Throughput: {self.list_success / self.elapsed_s:.2f} req/s")
+        print()
+        print("   Tool/call stats:")
+        print(f"      {self.call_success} success, {self.call_fail} failed")
+        if self.call_success > 0:
+            avg = sum(self.call_latencies_ms) / len(self.call_latencies_ms)
+            print(f"      Avg latency: {avg:.2f}ms")
+            print(f"      Throughput: {self.call_success / self.elapsed_s:.2f} req/s")
+
+
+def print_summary(init: PhaseStats, list_phase: PhaseStats, call: PhaseStats) -> None:
+    print("\n=== Summary:")
+    print(
+        f"   Init:      {init.throughput():.2f} req/s,  {init.avg_latency_ms():.2f}ms avg latency"
+    )
+    print(
+        f"   Tool/list: {list_phase.throughput():.2f} req/s,  "
+        f"{list_phase.avg_latency_ms():.2f}ms avg latency"
+    )
+    print(
+        f"   Tool call: {call.throughput():.2f} req/s,  "
+        f"{call.avg_latency_ms():.2f}ms avg latency"
+    )
+
+
+async def verify_tool_exists(
     server_url: str,
-    requests_per_user: int,
     tool_name: str,
-    tool_arguments: dict[str, Any] | None,
-) -> BenchmarkResult:
-    """
-    Run benchmark for a single virtual user.
-
-    Each user runs in its own process with its own MCP client session.
-    """
-
-    async def _run() -> BenchmarkResult:
-        latencies: list[float] = []
-        successful = 0
-        failed = 0
-        last_result = None
-
-        async with streamable_http_client(server_url) as (read_stream, write_stream, _):
+    http_headers: dict[str, str],
+) -> None:
+    try:
+        async with streamable_http_client(
+            server_url,
+            headers=http_headers if http_headers else None,
+        ) as (
+            read_stream,
+            write_stream,
+            _,
+        ):
             async with ClientSession(
                 read_stream,
                 write_stream,
-                client_info=Implementation(name="benchmark", version="1.0.0"),
+                client_info=CLIENT_INFO,
             ) as session:
-                # Initialize the session
                 await session.initialize()
+                result = await session.list_tools()
+                names = [t.name for t in result.tools]
+                if tool_name not in names:
+                    print(
+                        f"\nERROR: Tool '{tool_name}' not found on server",
+                        file=sys.stderr,
+                    )
+                    print("\nAvailable tools:", file=sys.stderr)
+                    for n in names:
+                        print(f"  - {n}", file=sys.stderr)
+                    raise SystemExit(1)
+    except SystemExit:
+        raise
+    except BaseException as e:
+        if _is_unauthorized(e):
+            print(
+                "HTTP 401 Unauthorized: add credentials, e.g.\n"
+                "  --auth-token YOUR_TOKEN\n"
+                "  -H 'Authorization: Bearer YOUR_TOKEN'\n"
+                "or set MCP_AUTH_TOKEN / MCP_AUTHORIZATION in the environment.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from e
+        raise
 
-                for _ in range(requests_per_user):
-                    start_time = time.perf_counter()
-                    try:
-                        result = await session.call_tool(tool_name, tool_arguments)
-                        elapsed_ms = (time.perf_counter() - start_time) * 1000
-                        successful += 1
-                        latencies.append(elapsed_ms)
-                        last_result = result
-                    except Exception:
-                        elapsed_ms = (time.perf_counter() - start_time) * 1000
-                        failed += 1
-                        latencies.append(elapsed_ms)
 
-        total_latency = sum(latencies)
-        return BenchmarkResult(
-            user_id=user_id,
-            total_requests=requests_per_user,
-            successful_requests=successful,
-            failed_requests=failed,
-            total_latency_ms=total_latency,
-            min_latency_ms=min(latencies) if latencies else 0.0,
-            max_latency_ms=max(latencies) if latencies else 0.0,
-            latencies=latencies,
-            last_result=last_result,
+async def user_init_benchmark(
+    server_url: str,
+    init_runs: int,
+    http_headers: dict[str, str],
+) -> tuple[int, int, list[float]]:
+    """One virtual user: init_runs full session handshakes (new connection each run)."""
+    successes = 0
+    failures = 0
+    latencies_ms: list[float] = []
+
+    for _ in range(init_runs):
+        t0 = time.perf_counter()
+        try:
+            async with streamable_http_client(
+                server_url,
+                headers=http_headers if http_headers else None,
+            ) as (
+                read_stream,
+                write_stream,
+                _,
+            ):
+                async with ClientSession(
+                    read_stream,
+                    write_stream,
+                    client_info=CLIENT_INFO,
+                ) as session:
+                    await session.initialize()
+            latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+            successes += 1
+        except Exception:
+            failures += 1
+
+    return successes, failures, latencies_ms
+
+
+def _phase1_process_worker(
+    server_url: str,
+    init_runs: int,
+    http_headers: dict[str, str],
+) -> tuple[int, int, list[float]]:
+    """Runs in child process: one client’s init phase."""
+    async def _run() -> tuple[int, int, list[float]]:
+        return await user_init_benchmark(server_url, init_runs, http_headers)
+
+    return asyncio.run(_run())
+
+
+def run_phase1_multiprocess(
+    server_url: str,
+    users: int,
+    init_runs: int,
+    http_headers: dict[str, str],
+) -> PhaseStats:
+    total_requests = users * init_runs
+    print(
+        f"\n=== Phase 1 - Init Benchmark: {users} clients x {init_runs} runs = "
+        f"{total_requests} total requests"
+    )
+    print(f"   Server: {server_url}")
+    print(f"   Concurrency: {users} processes (one per client)")
+
+    args = [(server_url, init_runs, dict(http_headers)) for _ in range(users)]
+
+    bench_start = time.perf_counter()
+    with mp.Pool(processes=users) as pool:
+        results = pool.starmap(_phase1_process_worker, args)
+    elapsed_s = time.perf_counter() - bench_start
+
+    successes = sum(r[0] for r in results)
+    failures = sum(r[1] for r in results)
+    latencies: list[float] = []
+    for r in results:
+        latencies.extend(r[2])
+
+    return PhaseStats(
+        name="Init",
+        total_requests=total_requests,
+        successful_requests=successes,
+        failed_requests=failures,
+        latencies_ms=latencies,
+        elapsed_s=elapsed_s,
+    )
+
+
+async def _user_list_and_call_async(
+    server_url: str,
+    init_runs: int,
+    runs: int,
+    tool_name: str,
+    tool_arguments: dict[str, Any] | None,
+    http_headers: dict[str, str],
+) -> tuple[
+    tuple[int, int, list[float]],
+    tuple[int, int, list[float]],
+    float,
+    float,
+]:
+    """One session: list_tools x init_runs, then call_tool x runs (same connection)."""
+    list_success = 0
+    list_fail = 0
+    list_latencies: list[float] = []
+    call_success = 0
+    call_fail = 0
+    call_latencies: list[float] = []
+
+    async with streamable_http_client(
+        server_url,
+        headers=http_headers if http_headers else None,
+    ) as (
+        read_stream,
+        write_stream,
+        _,
+    ):
+        async with ClientSession(
+            read_stream,
+            write_stream,
+            client_info=CLIENT_INFO,
+        ) as session:
+            s = cast(ClientSession, session)
+            await s.initialize()
+
+            t_list0 = time.perf_counter()
+            for _ in range(init_runs):
+                t0 = time.perf_counter()
+                try:
+                    await s.list_tools()
+                    list_latencies.append((time.perf_counter() - t0) * 1000.0)
+                    list_success += 1
+                except Exception:
+                    list_fail += 1
+            t_list1 = time.perf_counter()
+            list_elapsed = t_list1 - t_list0
+
+            t_call0 = time.perf_counter()
+            for _ in range(runs):
+                t0 = time.perf_counter()
+                try:
+                    await s.call_tool(tool_name, tool_arguments)
+                    call_latencies.append((time.perf_counter() - t0) * 1000.0)
+                    call_success += 1
+                except Exception:
+                    call_fail += 1
+            t_call1 = time.perf_counter()
+            call_elapsed = t_call1 - t_call0
+
+    return (
+        (list_success, list_fail, list_latencies),
+        (call_success, call_fail, call_latencies),
+        list_elapsed,
+        call_elapsed,
+    )
+
+
+def _phase23_process_worker(
+    server_url: str,
+    init_runs: int,
+    runs: int,
+    tool_name: str,
+    tool_arguments: dict[str, Any] | None,
+    http_headers: dict[str, str],
+) -> tuple[
+    tuple[int, int, list[float]],
+    tuple[int, int, list[float]],
+    float,
+    float,
+]:
+    """Runs in child process: one session, list phase then call phase."""
+    async def _run() -> tuple[
+        tuple[int, int, list[float]],
+        tuple[int, int, list[float]],
+        float,
+        float,
+    ]:
+        return await _user_list_and_call_async(
+            server_url,
+            init_runs,
+            runs,
+            tool_name,
+            tool_arguments,
+            http_headers,
         )
 
-    return anyio.run(_run)
+    return asyncio.run(_run())
+
+
+def run_phase23_multiprocess(
+    server_url: str,
+    users: int,
+    init_runs: int,
+    runs: int,
+    tool_name: str,
+    tool_arguments: dict[str, Any] | None,
+    http_headers: dict[str, str],
+    args_json: str,
+) -> tuple[PhaseStats, PhaseStats]:
+    list_total = users * init_runs
+    call_total = users * runs
+
+    print(
+        f"\n=== Phase 2 - Tool/list Benchmark: {users} clients x {init_runs} runs = "
+        f"{list_total} total requests"
+    )
+    print(f"   Server: {server_url}")
+
+    print(
+        f"\n=== Phase 3 - Tool Call Benchmark: {users} clients x {runs} runs = "
+        f"{call_total} total requests"
+    )
+    print(f"   Server: {server_url}")
+    print(f"   Tool: {tool_name}")
+    if args_json:
+        print(f"   Arguments: {args_json}")
+    print(f"   Concurrency: {users} processes (one per client)")
+
+    args = [
+        (
+            server_url,
+            init_runs,
+            runs,
+            tool_name,
+            tool_arguments,
+            dict(http_headers),
+        )
+        for _ in range(users)
+    ]
+
+    bench_start = time.perf_counter()
+    with mp.Pool(processes=users) as pool:
+        results = pool.starmap(_phase23_process_worker, args)
+    bench_end = time.perf_counter()
+
+    list_section_times: list[float] = []
+    call_section_times: list[float] = []
+    ls_succ = lf = 0
+    list_latencies: list[float] = []
+    cs_succ = cf = 0
+    call_latencies: list[float] = []
+
+    for r in results:
+        (a0, a1, la), (b0, b1, ca), list_elapsed, call_elapsed = r
+        ls_succ += a0
+        lf += a1
+        list_latencies.extend(la)
+        cs_succ += b0
+        cf += b1
+        call_latencies.extend(ca)
+        list_section_times.append(list_elapsed)
+        call_section_times.append(call_elapsed)
+
+    list_elapsed_s = max(list_section_times) if list_section_times else 0.0
+    call_elapsed_s = max(call_section_times) if call_section_times else 0.0
+    if list_elapsed_s <= 0.0:
+        list_elapsed_s = bench_end - bench_start
+    if call_elapsed_s <= 0.0:
+        call_elapsed_s = bench_end - bench_start
+
+    list_stats = PhaseStats(
+        name="Tool/list",
+        total_requests=list_total,
+        successful_requests=ls_succ,
+        failed_requests=lf,
+        latencies_ms=list_latencies,
+        elapsed_s=list_elapsed_s,
+    )
+    call_stats = PhaseStats(
+        name="Tool call",
+        total_requests=call_total,
+        successful_requests=cs_succ,
+        failed_requests=cf,
+        latencies_ms=call_latencies,
+        elapsed_s=call_elapsed_s,
+    )
+    return list_stats, call_stats
+
+
+async def _user_cyclic_benchmark(
+    server_url: str,
+    total_calls: int,
+    tool_name: str,
+    tool_arguments: dict[str, Any] | None,
+    http_headers: dict[str, str],
+    calls_per_cycle: int = 100,
+) -> tuple[int, int, int, int, int, int, list[float], list[float], list[float]]:
+    """
+    One virtual user running cyclic benchmark:
+    Each cycle: 1 session.init() -> 1 list_tools() -> N call_tool() (default N=100)
+    Cycles repeat until total call_tool count reaches total_calls.
+    
+    Returns: (init_success, init_fail, list_success, list_fail, call_success, call_fail,
+              init_latencies, list_latencies, call_latencies)
+    """
+    init_success = 0
+    init_fail = 0
+    list_success = 0
+    list_fail = 0
+    call_success = 0
+    call_fail = 0
+    init_latencies: list[float] = []
+    list_latencies: list[float] = []
+    call_latencies: list[float] = []
+    
+    calls_remaining = total_calls
+    
+    while calls_remaining > 0:
+        # Create a new session for each cycle
+        async with streamable_http_client(
+            server_url,
+            headers=http_headers if http_headers else None,
+        ) as (
+            read_stream,
+            write_stream,
+            _,
+        ):
+            async with ClientSession(
+                read_stream,
+                write_stream,
+                client_info=CLIENT_INFO,
+            ) as session:
+                # 1. Initialize session
+                t0 = time.perf_counter()
+                try:
+                    await session.initialize()
+                    init_latencies.append((time.perf_counter() - t0) * 1000.0)
+                    init_success += 1
+                except Exception:
+                    init_fail += 1
+                
+                # 2. List tools
+                t0 = time.perf_counter()
+                try:
+                    await session.list_tools()
+                    list_latencies.append((time.perf_counter() - t0) * 1000.0)
+                    list_success += 1
+                except Exception:
+                    list_fail += 1
+                
+                # 3. Call tool(s) - up to calls_per_cycle calls in this cycle
+                calls_this_cycle = min(calls_remaining, calls_per_cycle)
+                
+                for _ in range(calls_this_cycle):
+                    t0 = time.perf_counter()
+                    try:
+                        await session.call_tool(tool_name, tool_arguments)
+                        call_latencies.append((time.perf_counter() - t0) * 1000.0)
+                        call_success += 1
+                    except Exception:
+                        call_fail += 1
+                
+                calls_remaining -= calls_this_cycle
+    
+    return (
+        init_success, init_fail,
+        list_success, list_fail,
+        call_success, call_fail,
+        init_latencies, list_latencies, call_latencies,
+    )
+
+
+def _cyclic_process_worker(
+    server_url: str,
+    total_calls: int,
+    tool_name: str,
+    tool_arguments: dict[str, Any] | None,
+    http_headers: dict[str, str],
+    calls_per_cycle: int = 100,
+) -> tuple[int, int, int, int, int, int, list[float], list[float], list[float]]:
+    """Runs in child process: one client's cyclic benchmark."""
+    async def _run() -> tuple[int, int, int, int, int, int, list[float], list[float], list[float]]:
+        return await _user_cyclic_benchmark(
+            server_url,
+            total_calls,
+            tool_name,
+            tool_arguments,
+            http_headers,
+            calls_per_cycle,
+        )
+    
+    return asyncio.run(_run())
+
+
+def run_cyclic_benchmark_multiprocess(
+    server_url: str,
+    users: int,
+    total_calls: int,
+    tool_name: str,
+    tool_arguments: dict[str, Any] | None,
+    http_headers: dict[str, str],
+    args_json: str,
+    calls_per_cycle: int = 100,
+) -> CyclicStats:
+    """Run cyclic benchmark with multiple processes."""
+    print(f"\n=== Cyclic Benchmark: {users} clients x {total_calls} total tool calls each")
+    print(f"   Scenario per cycle: 1 init -> 1 list_tools -> {calls_per_cycle} call_tool")
+    print(f"   Cycles repeat until {total_calls} tool calls reached")
+    print(f"   Server: {server_url}")
+    print(f"   Tool: {tool_name}")
+    if args_json:
+        print(f"   Arguments: {args_json}")
+    print(f"   Concurrency: {users} processes (one per client)")
+    
+    args = [
+        (
+            server_url,
+            total_calls,
+            tool_name,
+            tool_arguments,
+            dict(http_headers),
+            calls_per_cycle,
+        )
+        for _ in range(users)
+    ]
+    
+    bench_start = time.perf_counter()
+    with mp.Pool(processes=users) as pool:
+        results = pool.starmap(_cyclic_process_worker, args)
+    elapsed_s = time.perf_counter() - bench_start
+    
+    # Aggregate results from all workers
+    total_init_success = sum(r[0] for r in results)
+    total_init_fail = sum(r[1] for r in results)
+    total_list_success = sum(r[2] for r in results)
+    total_list_fail = sum(r[3] for r in results)
+    total_call_success = sum(r[4] for r in results)
+    total_call_fail = sum(r[5] for r in results)
+    
+    all_init_latencies: list[float] = []
+    all_list_latencies: list[float] = []
+    all_call_latencies: list[float] = []
+    
+    for r in results:
+        all_init_latencies.extend(r[6])
+        all_list_latencies.extend(r[7])
+        all_call_latencies.extend(r[8])
+    
+    # Calculate totals
+    total_cycles = total_init_success + total_init_fail  # Each cycle attempts 1 init
+    total_inits = total_init_success + total_init_fail
+    total_lists = total_list_success + total_list_fail
+    total_calls_actual = total_call_success + total_call_fail
+    
+    return CyclicStats(
+        total_cycles=total_cycles,
+        total_inits=total_inits,
+        total_lists=total_lists,
+        total_calls=total_calls_actual,
+        init_success=total_init_success,
+        init_fail=total_init_fail,
+        list_success=total_list_success,
+        list_fail=total_list_fail,
+        call_success=total_call_success,
+        call_fail=total_call_fail,
+        init_latencies_ms=all_init_latencies,
+        list_latencies_ms=all_list_latencies,
+        call_latencies_ms=all_call_latencies,
+        elapsed_s=elapsed_s,
+    )
 
 
 def run_benchmark(
     server_url: str,
-    requests_per_user: int,
-    num_users: int,
+    users: int,
+    init_runs: int,
+    tool_runs: int,
     tool_name: str,
     tool_arguments: dict[str, Any] | None,
+    args_json: str,
+    http_headers: dict[str, str],
+    calls_per_cycle: int = 100,
 ) -> None:
-    """
-    Run the benchmark with multiple virtual users using multiprocessing.
-    """
-    print(f"\n{'='*60}")
-    print("MCP Server Benchmark")
-    print(f"{'='*60}")
-    print(f"Server URL:          {server_url}")
-    print(f"Virtual Users:       {num_users}")
-    print(f"Requests per User:   {requests_per_user}")
-    print(f"Tool:                {tool_name}")
-    print(f"Arguments:           {json.dumps(tool_arguments) if tool_arguments else '(none)'}")
-    print(f"Total Requests:      {num_users * requests_per_user}")
-    print(f"{'='*60}\n")
+    print("=== MCP Streamable HTTP Benchmark")
+    print("   Transport: Streamable HTTP")
+    print(f"   Server: {server_url}")
+    print(f"   Mode: Cyclic (1 init -> 1 list -> {calls_per_cycle} calls per cycle)")
+    print(f"   Users: {users}, Total tool calls per user: {tool_runs}")
+    print(f"   Verifying tool '{tool_name}' exists...")
 
-    start_time = time.perf_counter()
+    async def _verify() -> None:
+        await verify_tool_exists(server_url, tool_name, http_headers)
 
-    # Use multiprocessing - each user runs in its own process
-    with mp.Pool(processes=num_users) as pool:
-        results = pool.starmap(
-            run_user_benchmark,
-            [
-                (user_id, server_url, requests_per_user, tool_name, tool_arguments)
-                for user_id in range(num_users)
-            ],
-        )
+    asyncio.run(_verify())
+    print(f"   OK Tool '{tool_name}' found")
 
-    total_time = time.perf_counter() - start_time
-
-    # Aggregate results
-    total_requests = sum(r.total_requests for r in results)
-    successful_requests = sum(r.successful_requests for r in results)
-    failed_requests = sum(r.failed_requests for r in results)
-    all_latencies = [latency for r in results for latency in r.latencies]
-
-    avg_latency = sum(all_latencies) / len(all_latencies) if all_latencies else 0.0
-    min_latency = min(all_latencies) if all_latencies else 0.0
-    max_latency = max(all_latencies) if all_latencies else 0.0
-
-    # Calculate percentiles
-    sorted_latencies = sorted(all_latencies)
-    p50_idx = int(len(sorted_latencies) * 0.50)
-    p90_idx = int(len(sorted_latencies) * 0.90)
-    p95_idx = int(len(sorted_latencies) * 0.95)
-    p99_idx = int(len(sorted_latencies) * 0.99)
-
-    p50 = sorted_latencies[p50_idx] if sorted_latencies else 0.0
-    p90 = sorted_latencies[p90_idx] if sorted_latencies else 0.0
-    p95 = sorted_latencies[p95_idx] if sorted_latencies else 0.0
-    p99 = sorted_latencies[p99_idx] if sorted_latencies else 0.0
-
-    # Calculate throughput
-    throughput = total_requests / total_time if total_time > 0 else 0.0
-
-    # Print last tool call results first
-    if results and any(r.last_result is not None for r in results):
-        print(f"\n{'='*60}")
-        print("LAST TOOL CALL RESULTS")
-        print(f"{'='*60}")
-        for r in results:
-            if r.last_result is not None:
-                print(f"\nUser {r.user_id}:")
-                print(json.dumps(r.last_result.model_dump() if hasattr(r.last_result, 'model_dump') else r.last_result, indent=2, default=str))
-        print()
-
-    # Print summary
-    print(f"\n{'='*60}")
-    print("BENCHMARK SUMMARY")
-    print(f"{'='*60}")
-    print(f"\nTiming:")
-    print(f"  Total Time:          {total_time:.2f} seconds")
-    print(f"\nThroughput:")
-    print(f"  Requests/sec:        {throughput:.2f}")
-    print(f"\nLatency:")
-    print(f"  Average:             {avg_latency:.2f} ms")
-    print(f"  Min:                 {min_latency:.2f} ms")
-    print(f"  Max:                 {max_latency:.2f} ms")
-    print(f"  p50:                 {p50:.2f} ms")
-    print(f"  p90:                 {p90:.2f} ms")
-    print(f"  p95:                 {p95:.2f} ms")
-    print(f"  p99:                 {p99:.2f} ms")
-    print(f"\nRequests:")
-    print(f"  Total:               {total_requests}")
-    print(f"  Successful:          {successful_requests}")
-    print(f"  Failed:              {failed_requests}")
-    print(f"  Success Rate:        {(successful_requests/total_requests*100):.2f}%")
-    print(f"{'='*60}\n")
+    # Run cyclic benchmark
+    cyclic_stats = run_cyclic_benchmark_multiprocess(
+        server_url,
+        users,
+        tool_runs,
+        tool_name,
+        tool_arguments,
+        http_headers,
+        args_json,
+        calls_per_cycle,
+    )
+    cyclic_stats.print_results()
 
 
 def main() -> None:
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass  # already set (e.g. tests / embedding)
+
     parser = argparse.ArgumentParser(
-        description="Benchmark MCP server with concurrent virtual users"
+        description="MCP Streamable HTTP benchmark - cyclic mode only"
     )
     parser.add_argument(
         "-s",
         "--server",
-        required=True,
-        help="MCP server URL (e.g., http://localhost:8000/mcp)",
+        default="http://localhost:8000/mcp",
+        help="MCP server URL",
     )
     parser.add_argument(
         "-r",
         "--requests",
         type=int,
-        required=True,
-        help="Number of requests per virtual user",
+        default=100,
+        dest="runs",
+        help="Tool call runs per user (total cycles)",
     )
     parser.add_argument(
         "-u",
         "--users",
         type=int,
-        required=True,
-        help="Number of virtual users (processes)",
+        default=1,
+        help="Number of concurrent clients (processes)",
     )
     parser.add_argument(
         "-t",
         "--tool",
-        required=True,
+        default="say_hello",
         help="Tool name to call",
     )
     parser.add_argument(
         "-a",
         "--arguments",
-        help="Tool arguments in JSON format (e.g., '{\"name\":\"value}')",
+        default="{}",
+        help='Tool arguments as JSON object (default: "{}")',
+    )
+    parser.add_argument(
+        "-H",
+        "--header",
+        action="append",
+        default=[],
+        dest="headers",
+        metavar="HEADER",
+        help='Extra HTTP header, e.g. -H "Authorization: Bearer <token>"',
+    )
+    parser.add_argument(
+        "--auth-token",
+        default=None,
+        help="Shortcut for Authorization: Bearer <token>",
+    )
+    parser.add_argument(
+        "--calls-per-cycle",
+        type=int,
+        default=100,
+        dest="calls_per_cycle",
+        help="Number of call_tool operations per cycle (default: 100)",
     )
 
-    args = parser.parse_args()
+    ns = parser.parse_args()
+    runs: int = getattr(ns, "runs", 100)
+    users: int = getattr(ns, "users", 1)
+    server_url: str = getattr(ns, "server", "http://localhost:8000/mcp")
+    tool_name: str = getattr(ns, "tool", "say_hello")
+    arguments_str: str = getattr(ns, "arguments", "{}")
+    cli_headers: list[str] = getattr(ns, "headers", []) or []
+    auth_token: str | None = getattr(ns, "auth_token", None)
+    calls_per_cycle: int = getattr(ns, "calls_per_cycle", 100)
 
-    # Parse arguments JSON
-    tool_arguments: dict[str, Any] | None = None
-    if args.arguments:
+    if os.environ.get("RUNS"):
         try:
-            tool_arguments = json.loads(args.arguments)
-        except json.JSONDecodeError as e:
-            print(f"Error: Invalid JSON in arguments: {e}")
-            return
+            n = int(os.environ["RUNS"])
+            if n > 0:
+                runs = n
+        except ValueError:
+            pass
 
-    # Set multiprocessing start method to 'spawn' for clean process isolation
-    mp.set_start_method("spawn", force=True)
+    tool_arguments: dict[str, Any] | None = None
+    args_json = arguments_str.strip()
+    if args_json:
+        try:
+            parsed = json.loads(args_json)
+        except json.JSONDecodeError as e:
+            print(f"Error: Invalid JSON in arguments: {e}", file=sys.stderr)
+            raise SystemExit(1) from e
+        if not isinstance(parsed, dict):
+            print("Error: JSON arguments must be an object", file=sys.stderr)
+            raise SystemExit(1)
+        tool_arguments = parsed
+
+    http_headers = merge_http_headers(cli_headers, auth_token)
 
     run_benchmark(
-        server_url=args.server,
-        requests_per_user=args.requests,
-        num_users=args.users,
-        tool_name=args.tool,
+        server_url=server_url,
+        users=users,
+        init_runs=runs,
+        tool_runs=runs,
+        tool_name=tool_name,
         tool_arguments=tool_arguments,
+        args_json=args_json,
+        http_headers=http_headers,
+        calls_per_cycle=calls_per_cycle,
     )
 
 

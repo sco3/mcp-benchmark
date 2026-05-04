@@ -1,2 +1,5 @@
 .venv
 target
+__pycache__/
+.project
+gomcp-benchmark
