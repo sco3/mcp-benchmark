@@ -45,7 +45,7 @@ func (p phaseResult) throughputRPS() float64 {
 }
 
 func printPhase(p phaseResult) {
-	fmt.Printf("\n📊 %s Results:\n", p.name)
+	fmt.Printf("\n=== %s Results:\n", p.name)
 	fmt.Printf("   Total: %d requests (%d success, %d failed)\n", p.totalRequests, p.successfulRequests, p.failedRequests)
 	fmt.Printf("   Elapsed: %.2fs\n", p.elapsed.Seconds())
 	fmt.Printf("   Avg latency: %.2fms\n", p.avgLatencyMs())
@@ -54,8 +54,8 @@ func printPhase(p phaseResult) {
 
 func main() {
 	serverURL := flag.String("s", "http://localhost:8000/mcp", "server URL")
-	runs := flag.Int("r", 100, "number of requests")
-	initRuns := flag.Int("i", 0, "number of runs for init and tools/list (default: same as -r)")
+	runs := flag.Int("r", 100, "number of tool call runs (total across all cycles)")
+	callsPerCycle := flag.Int("calls-per-cycle", 100, "number of tool calls per cycle (default: 100)")
 	toolName := flag.String("t", "say_hello", "tool name to call")
 	args := flag.String("a", "{}", "arguments in JSON format")
 	users := flag.Int("u", 1, "number of virtual users")
@@ -65,9 +65,6 @@ func main() {
 		if n, err := strconv.Atoi(r); err == nil && n > 0 {
 			*runs = n
 		}
-	}
-	if *initRuns <= 0 {
-		*initRuns = *runs
 	}
 
 	url := *serverURL
@@ -84,10 +81,11 @@ func main() {
 	ctx := context.Background()
 	client := &http.Client{Timeout: 30 * time.Second}
 
-	fmt.Printf("🔌 MCP Streamable HTTP Benchmark\n")
+	fmt.Printf("MCP Streamable HTTP Benchmark\n")
 	fmt.Printf("   Transport: Streamable HTTP\n")
-	fmt.Printf("   Users: %d, Init runs: %d, Tool call runs: %d\n", *users, *initRuns, *runs)
+	fmt.Printf("   Users: %d, Tool call runs: %d\n", *users, *runs)
 	fmt.Printf("   Server: %s\n", url)
+	fmt.Printf("   Scenario per cycle: 1 init -> 1 list_tools -> %d call_tool\n", *callsPerCycle)
 
 	// Best-effort tool verification (matches sdk-benchmark output shape)
 	fmt.Printf("   Verifying tool '%s' exists...\n", *toolName)
@@ -95,19 +93,32 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Printf("   ✅ Tool '%s' found\n", *toolName)
+	fmt.Printf("   [OK] Tool '%s' found\n", *toolName)
 
 	// Create sessions for each virtual user
 	type userSession struct {
 		sessionID string
 	}
 
-	// Phase 1: Init benchmark (initialize + notifications/initialized; new session each run)
-	var initPhase phaseResult
+	// Cyclic benchmark: each cycle is 1 init -> 1 list -> N calls
+	// Total cycles = ceil(total_calls / calls_per_cycle) per user
+	totalCalls := *runs
+	cyclesPerUser := (totalCalls + *callsPerCycle - 1) / *callsPerCycle
+	if totalCalls%*callsPerCycle == 0 && totalCalls > 0 {
+		cyclesPerUser = totalCalls / *callsPerCycle
+	} else if totalCalls == 0 {
+		cyclesPerUser = 0
+	}
+
+	var cyclicStats phaseResult
 	{
-		totalRuns := (*initRuns) * (*users)
-		fmt.Printf("\n🚀 Phase 1 - Init Benchmark: %d clients × %d runs = %d total requests\n", *users, *initRuns, totalRuns)
+		fmt.Printf("\n=== Cyclic Benchmark: %d clients x %d cycles = %d total cycles\n", *users, cyclesPerUser, cyclesPerUser**users)
 		fmt.Printf("   Server: %s\n", url)
+		fmt.Printf("   Tool: %s\n", *toolName)
+		if *args != "" {
+			fmt.Printf("   Arguments: %s\n", *args)
+		}
+		fmt.Printf("   Concurrency: %d processes (one per client)\n", *users)
 
 		var allLatencies []time.Duration
 		var successfulRequests atomic.Int64
@@ -124,56 +135,104 @@ func main() {
 				var localSuccess int64
 				var localFailed int64
 
-				for j := 0; j < *initRuns; j++ {
-					t0 := time.Now()
+				callsRemaining := totalCalls
+				for callsRemaining > 0 {
+					callsThisCycle := *callsPerCycle
+					if callsRemaining < *callsPerCycle {
+						callsThisCycle = callsRemaining
+					}
 
+					// 1. Initialize session (new session each cycle)
 					req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(initReq))
 					if err != nil {
-						if j == 0 {
-							fmt.Fprintf(os.Stderr, "user %d create init request: %v\n", userIdx, err)
-						}
 						localFailed++
+						callsRemaining -= callsThisCycle
 						continue
 					}
 					req.Header = baseHeaders.Clone()
 					resp, err := client.Do(req)
 					if err != nil {
-						if j == 0 {
-							fmt.Fprintf(os.Stderr, "user %d init request %d: %v\n", userIdx, j, err)
+						if userIdx == 0 && callsRemaining == totalCalls {
+							fmt.Fprintf(os.Stderr, "user %d init request: %v\n", userIdx, err)
 						}
 						localFailed++
+						callsRemaining -= callsThisCycle
 						continue
 					}
 
 					sessionID := resp.Header.Get("Mcp-Session-Id")
 					_ = resp.Body.Close()
 					if sessionID == "" {
-						if j == 0 {
-							fmt.Fprintf(os.Stderr, "user %d init request %d: no session ID in response\n", userIdx, j)
+						if userIdx == 0 && callsRemaining == totalCalls {
+							fmt.Fprintf(os.Stderr, "user %d init request: no session ID in response\n", userIdx)
 						}
 						localFailed++
+						callsRemaining -= callsThisCycle
 						continue
 					}
 
 					req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(notifyReq))
 					if err != nil {
 						localFailed++
+						callsRemaining -= callsThisCycle
 						continue
 					}
 					req.Header = baseHeaders.Clone()
 					req.Header.Set("Mcp-Session-Id", sessionID)
 					resp, err = client.Do(req)
 					if err != nil {
-						if j == 0 {
-							fmt.Fprintf(os.Stderr, "user %d notify request %d: %v\n", userIdx, j, err)
+						if userIdx == 0 && callsRemaining == totalCalls {
+							fmt.Fprintf(os.Stderr, "user %d notify request: %v\n", userIdx, err)
 						}
 						localFailed++
+						callsRemaining -= callsThisCycle
 						continue
 					}
 					_ = resp.Body.Close()
 
-					localLatencies = append(localLatencies, time.Since(t0))
-					localSuccess++
+					// 2. List tools
+					req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(listReq))
+					if err != nil {
+						localFailed++
+						callsRemaining -= callsThisCycle
+						continue
+					}
+					req.Header = baseHeaders.Clone()
+					req.Header.Set("Mcp-Session-Id", sessionID)
+					resp, err = client.Do(req)
+					if err != nil {
+						if userIdx == 0 && callsRemaining == totalCalls {
+							fmt.Fprintf(os.Stderr, "user %d tools/list request: %v\n", userIdx, err)
+						}
+						localFailed++
+						callsRemaining -= callsThisCycle
+						continue
+					}
+					_ = resp.Body.Close()
+
+					// 3. Call tool(s)
+					for j := 0; j < callsThisCycle; j++ {
+						req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(callReq))
+						if err != nil {
+							localFailed++
+							continue
+						}
+						req.Header = baseHeaders.Clone()
+						req.Header.Set("Mcp-Session-Id", sessionID)
+
+						latency, err := measureRequest(client, req)
+						if err != nil {
+							if userIdx == 0 && callsRemaining == totalCalls && j == 0 {
+								fmt.Fprintf(os.Stderr, "user %d tool call request: %v\n", userIdx, err)
+							}
+							localFailed++
+							continue
+						}
+						localLatencies = append(localLatencies, latency)
+						localSuccess++
+					}
+
+					callsRemaining -= callsThisCycle
 				}
 
 				mu.Lock()
@@ -185,171 +244,19 @@ func main() {
 		}
 		wg.Wait()
 		totalElapsed := time.Since(benchStart)
-		initPhase = phaseResult{
-			name:               "Init",
-			totalRequests:      totalRuns,
+		cyclicStats = phaseResult{
+			name:               "Cyclic",
+			totalRequests:      totalCalls * *users,
 			successfulRequests: successfulRequests.Load(),
 			failedRequests:     failedRequests.Load(),
 			latencies:          allLatencies,
 			elapsed:            totalElapsed,
 		}
-		printPhase(initPhase)
+		printPhase(cyclicStats)
 	}
 
-	// Create sessions once for tools/list and tools/call phases
-	sessions := make([]*userSession, *users)
-	for i := 0; i < *users; i++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(initReq))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "user %d create init request: %v\n", i, err)
-			os.Exit(1)
-		}
-		req.Header = baseHeaders.Clone()
-
-		resp, err := client.Do(req)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "user %d init request: %v\n", i, err)
-			os.Exit(1)
-		}
-
-		sessionID := resp.Header.Get("Mcp-Session-Id")
-		_ = resp.Body.Close()
-		if sessionID == "" {
-			fmt.Fprintf(os.Stderr, "user %d: no session ID in response\n", i)
-			os.Exit(1)
-		}
-
-		req, _ = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(notifyReq))
-		req.Header = baseHeaders.Clone()
-		req.Header.Set("Mcp-Session-Id", sessionID)
-		resp, err = client.Do(req)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "user %d notify request: %v\n", i, err)
-			os.Exit(1)
-		}
-		_ = resp.Body.Close()
-
-		sessions[i] = &userSession{sessionID: sessionID}
-	}
-
-	// Phase 2: tools/list benchmark (reuse sessions)
-	var listPhase phaseResult
-	{
-		totalRuns := (*initRuns) * (*users)
-		fmt.Printf("\n🚀 Phase 2 - Tool/list Benchmark: %d clients × %d runs = %d total requests\n", *users, *initRuns, totalRuns)
-		fmt.Printf("   Server: %s\n", url)
-
-		var allLatencies []time.Duration
-		var successfulRequests atomic.Int64
-		var failedRequests atomic.Int64
-		var mu sync.Mutex
-		benchStart := time.Now()
-
-		var wg sync.WaitGroup
-		for i := 0; i < *users; i++ {
-			wg.Add(1)
-			go func(userIdx int, session *userSession) {
-				defer wg.Done()
-				userHeaders := baseHeaders.Clone()
-				userHeaders.Set("Mcp-Session-Id", session.sessionID)
-
-				var localLatencies []time.Duration
-				for j := 0; j < *initRuns; j++ {
-					req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(listReq))
-					req.Header = userHeaders.Clone()
-
-					latency, err := measureRequest(client, req)
-					if err != nil {
-						if j == 0 {
-							fmt.Fprintf(os.Stderr, "user %d tools/list request %d: %v\n", userIdx, j, err)
-						}
-						failedRequests.Add(1)
-						continue
-					}
-					localLatencies = append(localLatencies, latency)
-					successfulRequests.Add(1)
-				}
-
-				mu.Lock()
-				allLatencies = append(allLatencies, localLatencies...)
-				mu.Unlock()
-			}(i, sessions[i])
-		}
-		wg.Wait()
-		totalElapsed := time.Since(benchStart)
-		listPhase = phaseResult{
-			name:               "Tool/list",
-			totalRequests:      totalRuns,
-			successfulRequests: successfulRequests.Load(),
-			failedRequests:     failedRequests.Load(),
-			latencies:          allLatencies,
-			elapsed:            totalElapsed,
-		}
-		printPhase(listPhase)
-	}
-
-	// Benchmark tool calls with all users in parallel
-	{
-		totalRuns := (*runs) * (*users)
-		fmt.Printf("\n🚀 Phase 3 - Tool Call Benchmark: %d clients × %d runs = %d total requests\n", *users, *runs, totalRuns)
-		fmt.Printf("   Server: %s\n", url)
-		fmt.Printf("   Tool: %s\n", *toolName)
-		if *args != "" {
-			fmt.Printf("   Arguments: %s\n", *args)
-		}
-	}
-
-	var allLatencies []time.Duration
-	var successfulRequests atomic.Int64
-	var failedRequests atomic.Int64
-	var mu sync.Mutex
-	benchStart := time.Now()
-
-	var wg sync.WaitGroup
-	for i := 0; i < *users; i++ {
-		wg.Add(1)
-		go func(userIdx int, session *userSession) {
-			defer wg.Done()
-			userHeaders := baseHeaders.Clone()
-			userHeaders.Set("Mcp-Session-Id", session.sessionID)
-
-			var localLatencies []time.Duration
-			for j := 0; j < *runs; j++ {
-				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(callReq))
-				req.Header = userHeaders.Clone()
-
-				latency, err := measureRequest(client, req)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "user %d request %d: %v\n", userIdx, j, err)
-					failedRequests.Add(1)
-					continue
-				}
-				localLatencies = append(localLatencies, latency)
-				successfulRequests.Add(1)
-			}
-
-			mu.Lock()
-			allLatencies = append(allLatencies, localLatencies...)
-			mu.Unlock()
-		}(i, sessions[i])
-	}
-	wg.Wait()
-	totalElapsed := time.Since(benchStart)
-	totalRuns := *runs * *users
-	toolPhase := phaseResult{
-		name:               "Tool call",
-		totalRequests:      totalRuns,
-		successfulRequests: successfulRequests.Load(),
-		failedRequests:     failedRequests.Load(),
-		latencies:          allLatencies,
-		elapsed:            totalElapsed,
-	}
-	printPhase(toolPhase)
-
-	fmt.Printf("\n📈 Summary:\n")
-	fmt.Printf("   Init:      %.2f req/s,  %.2fms avg latency\n", initPhase.throughputRPS(), initPhase.avgLatencyMs())
-	fmt.Printf("   Tool/list: %.2f req/s,  %.2fms avg latency\n", listPhase.throughputRPS(), listPhase.avgLatencyMs())
-	fmt.Printf("   Tool call: %.2f req/s,  %.2fms avg latency\n", toolPhase.throughputRPS(), toolPhase.avgLatencyMs())
+	fmt.Printf("\n=== Summary:\n")
+	fmt.Printf("   Cyclic: %.2f req/s,  %.2fms avg latency\n", cyclicStats.throughputRPS(), cyclicStats.avgLatencyMs())
 }
 
 func verifyToolExists(
