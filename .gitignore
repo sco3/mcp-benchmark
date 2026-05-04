@@ -1,4 +1,1 @@
-.venv
-target
-__pycache__/
-gomcp-benchmark
+Nothing should be ignored in this case, as only a Python source file (`benchmark.py`) was modified and there are no build artifacts, dependencies, or temporary files in the change list.
