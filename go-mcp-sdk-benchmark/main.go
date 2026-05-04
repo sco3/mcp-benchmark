@@ -116,7 +116,7 @@ func main() {
 		headers["Authorization"] = "Bearer " + strings.TrimSpace(envBearer)
 	}
 
-	fmt.Printf("🔌 MCP SDK Benchmark (using go official mcp sdk)\n")
+	fmt.Printf("MCP SDK Benchmark (using go official mcp sdk)\n")
 	fmt.Printf("   Transport: Streamable HTTP\n")
 	fmt.Printf("   Users: %d, Runs: %d, Calls per cycle: %d\n", *users, *runs, *callsPerCycle)
 	fmt.Printf("   Server: %s\n", *serverURL)

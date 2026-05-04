@@ -167,7 +167,7 @@ func main() {
 	listReq := `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`
 	callReq := fmt.Sprintf(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"%s","arguments":%s}}`, *toolName, *argsStr)
 
-	fmt.Printf("🔌 MCP Streamable HTTP Benchmark\n")
+	fmt.Printf("MCP Streamable HTTP Benchmark\n")
 	fmt.Printf("   Transport: Streamable HTTP\n")
 	fmt.Printf("   Users: %d, Runs: %d, Calls per cycle: %d\n", *users, *runs, *callsPerCycle)
 	fmt.Printf("   Server: %s\n", url)
