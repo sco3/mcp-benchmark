@@ -1,9 +1,6 @@
-```
-# Binaries
-*
-# Dependencies
-/go.mod
-/go.sum
-/server/go.mod
-/server/go.sum
-```
+.venv
+target
+__pycache__/
+gomcp-benchmark
+.project
+
