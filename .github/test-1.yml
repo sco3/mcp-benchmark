@@ -1,0 +1,60 @@
+name: Test Python and Go Benchmarks
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install uv
+      run: |
+        pip install uv
+
+    - name: Build the server
+      working-directory: ./server
+      run: |
+        go build -o fast-time-server .
+
+    - name: Start the server in background
+      working-directory: ./server
+      run: |
+        nohup ./fast-time-server -port=8080 -transport=http > server.log 2>&1 &
+        sleep 3
+        echo "Server started, checking if it's running..."
+        ps aux | grep fast-time-server
+
+    - name: Run Python benchmark
+      run: |
+        uv run benchmark.py -s http://localhost:8080/http -t get_system_time
+
+    - name: Build Go benchmark
+      run: |
+        go build -o gomcp-benchmark .
+      working-directory: . # Assuming the Go benchmark source is in root
+
+    - name: Run Go benchmark
+      run: |
+        ./gomcp-benchmark -s http://localhost:8080/http -t get_system_time
+
+    - name: Display server logs (for debugging)
+      if: always()
+      run: |
+        cat server/server.log || echo "No server log found"
