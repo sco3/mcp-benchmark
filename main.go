@@ -409,7 +409,8 @@ func verifyToolExists(
 	}
 	defer resp.Body.Close()
 
-	body, err := readSSE(resp.Body)
+	
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
