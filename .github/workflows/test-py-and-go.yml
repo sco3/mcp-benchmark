@@ -55,6 +55,16 @@ jobs:
         ./go-mcp-sdk-benchmark/go-mcp-sdk-benchmark -s http://localhost:8080/http -t get_system_time
       working-directory: .
 
+    - name: Build root Go benchmark
+      run: |
+        go build -o gomcp-benchmark .
+      working-directory: .
+
+    - name: Run root Go benchmark
+      run: |
+        ./gomcp-benchmark -s http://localhost:8080/http -t get_system_time
+      working-directory: .
+
     - name: Display server logs (for debugging)
       if: always()
       run: |
