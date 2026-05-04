@@ -1,4 +1,5 @@
-```
-# Compiled and build artifacts
-benchmark-go
-```
+.venv
+target
+__pycache__/
+gomcp-benchmark
+.project
