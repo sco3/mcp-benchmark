@@ -6,8 +6,10 @@ Concurrency: one OS process per virtual user (`-u`). Each process runs its own
 `asyncio.run()` for MCP async I/O.
 
 Scenario: Cyclic benchmark where each cycle is:
-  1 session.init() -> 1 list_tools() -> 1 call_tool()
+  1 session.init() -> 1 list_tools() -> N call_tool() (default N=100)
 Cycles repeat until total call_tool count reaches the configured (-r) runs.
+
+Use --calls-per-cycle to configure N (default: 100).
 """
 
 from __future__ import annotations
@@ -507,10 +509,11 @@ async def _user_cyclic_benchmark(
     tool_name: str,
     tool_arguments: dict[str, Any] | None,
     http_headers: dict[str, str],
+    calls_per_cycle: int = 100,
 ) -> tuple[int, int, int, int, int, int, list[float], list[float], list[float]]:
     """
     One virtual user running cyclic benchmark:
-    Each cycle: 1 session.init() -> 1 list_tools() -> N call_tool()
+    Each cycle: 1 session.init() -> 1 list_tools() -> N call_tool() (default N=100)
     Cycles repeat until total call_tool count reaches total_calls.
     
     Returns: (init_success, init_fail, list_success, list_fail, call_success, call_fail,
@@ -561,9 +564,8 @@ async def _user_cyclic_benchmark(
                 except Exception:
                     list_fail += 1
                 
-                # 3. Call tool(s) - distribute calls across cycles
-                # Each cycle does at least 1 call, or remaining calls if less than cycle target
-                calls_this_cycle = max(1, min(calls_remaining, 1))
+                # 3. Call tool(s) - up to calls_per_cycle calls in this cycle
+                calls_this_cycle = min(calls_remaining, calls_per_cycle)
                 
                 for _ in range(calls_this_cycle):
                     t0 = time.perf_counter()
@@ -590,6 +592,7 @@ def _cyclic_process_worker(
     tool_name: str,
     tool_arguments: dict[str, Any] | None,
     http_headers: dict[str, str],
+    calls_per_cycle: int = 100,
 ) -> tuple[int, int, int, int, int, int, list[float], list[float], list[float]]:
     """Runs in child process: one client's cyclic benchmark."""
     async def _run() -> tuple[int, int, int, int, int, int, list[float], list[float], list[float]]:
@@ -599,6 +602,7 @@ def _cyclic_process_worker(
             tool_name,
             tool_arguments,
             http_headers,
+            calls_per_cycle,
         )
     
     return asyncio.run(_run())
@@ -612,10 +616,11 @@ def run_cyclic_benchmark_multiprocess(
     tool_arguments: dict[str, Any] | None,
     http_headers: dict[str, str],
     args_json: str,
+    calls_per_cycle: int = 100,
 ) -> CyclicStats:
     """Run cyclic benchmark with multiple processes."""
     print(f"\n=== Cyclic Benchmark: {users} clients x {total_calls} total tool calls each")
-    print(f"   Scenario per cycle: 1 init -> 1 list_tools -> 1 call_tool")
+    print(f"   Scenario per cycle: 1 init -> 1 list_tools -> {calls_per_cycle} call_tool")
     print(f"   Cycles repeat until {total_calls} tool calls reached")
     print(f"   Server: {server_url}")
     print(f"   Tool: {tool_name}")
@@ -630,6 +635,7 @@ def run_cyclic_benchmark_multiprocess(
             tool_name,
             tool_arguments,
             dict(http_headers),
+            calls_per_cycle,
         )
         for _ in range(users)
     ]
@@ -689,11 +695,12 @@ def run_benchmark(
     tool_arguments: dict[str, Any] | None,
     args_json: str,
     http_headers: dict[str, str],
+    calls_per_cycle: int = 100,
 ) -> None:
     print("=== MCP Streamable HTTP Benchmark")
     print("   Transport: Streamable HTTP")
     print(f"   Server: {server_url}")
-    print(f"   Mode: Cyclic (1 init -> 1 list -> 1 call per cycle)")
+    print(f"   Mode: Cyclic (1 init -> 1 list -> {calls_per_cycle} calls per cycle)")
     print(f"   Users: {users}, Total tool calls per user: {tool_runs}")
     print(f"   Verifying tool '{tool_name}' exists...")
 
@@ -712,6 +719,7 @@ def run_benchmark(
         tool_arguments,
         http_headers,
         args_json,
+        calls_per_cycle,
     )
     cyclic_stats.print_results()
 
@@ -772,6 +780,13 @@ def main() -> None:
         default=None,
         help="Shortcut for Authorization: Bearer <token>",
     )
+    parser.add_argument(
+        "--calls-per-cycle",
+        type=int,
+        default=100,
+        dest="calls_per_cycle",
+        help="Number of call_tool operations per cycle (default: 100)",
+    )
 
     ns = parser.parse_args()
     runs: int = getattr(ns, "runs", 100)
@@ -781,6 +796,7 @@ def main() -> None:
     arguments_str: str = getattr(ns, "arguments", "{}")
     cli_headers: list[str] = getattr(ns, "headers", []) or []
     auth_token: str | None = getattr(ns, "auth_token", None)
+    calls_per_cycle: int = getattr(ns, "calls_per_cycle", 100)
 
     if os.environ.get("RUNS"):
         try:
@@ -814,6 +830,7 @@ def main() -> None:
         tool_arguments=tool_arguments,
         args_json=args_json,
         http_headers=http_headers,
+        calls_per_cycle=calls_per_cycle,
     )
 
 
