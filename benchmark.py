@@ -185,10 +185,13 @@ def print_summary(init: PhaseStats, list_phase: PhaseStats, call: PhaseStats) ->
 async def verify_tool_exists(
     server_url: str,
     tool_name: str,
-    http_client: httpx.AsyncClient,
+    http_headers: dict[str, str],
 ) -> None:
     try:
-        async with streamable_http_client(server_url, http_client=http_client) as (
+        async with streamable_http_client(
+            server_url,
+            headers=http_headers if http_headers else None,
+        ) as (
             read_stream,
             write_stream,
             _,
@@ -228,7 +231,7 @@ async def verify_tool_exists(
 async def user_init_benchmark(
     server_url: str,
     init_runs: int,
-    http_client: httpx.AsyncClient,
+    http_headers: dict[str, str],
 ) -> tuple[int, int, list[float]]:
     """One virtual user: init_runs full session handshakes (new connection each run)."""
     successes = 0
@@ -238,7 +241,10 @@ async def user_init_benchmark(
     for _ in range(init_runs):
         t0 = time.perf_counter()
         try:
-            async with streamable_http_client(server_url, http_client=http_client) as (
+            async with streamable_http_client(
+                server_url,
+                headers=http_headers if http_headers else None,
+            ) as (
                 read_stream,
                 write_stream,
                 _,
@@ -264,8 +270,7 @@ def _phase1_process_worker(
 ) -> tuple[int, int, list[float]]:
     """Runs in child process: one client’s init phase."""
     async def _run() -> tuple[int, int, list[float]]:
-        async with make_http_client(http_headers) as http_client:
-            return await user_init_benchmark(server_url, init_runs, http_client)
+        return await user_init_benchmark(server_url, init_runs, http_headers)
 
     return asyncio.run(_run())
 
@@ -313,7 +318,7 @@ async def _user_list_and_call_async(
     runs: int,
     tool_name: str,
     tool_arguments: dict[str, Any] | None,
-    http_client: httpx.AsyncClient,
+    http_headers: dict[str, str],
 ) -> tuple[
     tuple[int, int, list[float]],
     tuple[int, int, list[float]],
@@ -328,7 +333,10 @@ async def _user_list_and_call_async(
     call_fail = 0
     call_latencies: list[float] = []
 
-    async with streamable_http_client(server_url, http_client=http_client) as (
+    async with streamable_http_client(
+        server_url,
+        headers=http_headers if http_headers else None,
+    ) as (
         read_stream,
         write_stream,
         _,
@@ -393,15 +401,14 @@ def _phase23_process_worker(
         float,
         float,
     ]:
-        async with make_http_client(http_headers) as http_client:
-            return await _user_list_and_call_async(
-                server_url,
-                init_runs,
-                runs,
-                tool_name,
-                tool_arguments,
-                http_client,
-            )
+        return await _user_list_and_call_async(
+            server_url,
+            init_runs,
+            runs,
+            tool_name,
+            tool_arguments,
+            http_headers,
+        )
 
     return asyncio.run(_run())
 
@@ -501,7 +508,7 @@ async def _user_cyclic_benchmark(
     total_calls: int,
     tool_name: str,
     tool_arguments: dict[str, Any] | None,
-    http_client: httpx.AsyncClient,
+    http_headers: dict[str, str],
 ) -> tuple[int, int, int, int, int, int, list[float], list[float], list[float]]:
     """
     One virtual user running cyclic benchmark:
@@ -525,7 +532,10 @@ async def _user_cyclic_benchmark(
     
     while calls_remaining > 0:
         # Create a new session for each cycle
-        async with streamable_http_client(server_url, http_client=http_client) as (
+        async with streamable_http_client(
+            server_url,
+            headers=http_headers if http_headers else None,
+        ) as (
             read_stream,
             write_stream,
             _,
@@ -585,14 +595,13 @@ def _cyclic_process_worker(
 ) -> tuple[int, int, int, int, int, int, list[float], list[float], list[float]]:
     """Runs in child process: one client's cyclic benchmark."""
     async def _run() -> tuple[int, int, int, int, int, int, list[float], list[float], list[float]]:
-        async with make_http_client(http_headers) as http_client:
-            return await _user_cyclic_benchmark(
-                server_url,
-                total_calls,
-                tool_name,
-                tool_arguments,
-                http_client,
-            )
+        return await _user_cyclic_benchmark(
+            server_url,
+            total_calls,
+            tool_name,
+            tool_arguments,
+            http_headers,
+        )
     
     return asyncio.run(_run())
 
@@ -699,8 +708,7 @@ def run_benchmark(
     print(f"   Verifying tool '{tool_name}' exists...")
 
     async def _verify() -> None:
-        async with make_http_client(http_headers) as http_client:
-            await verify_tool_exists(server_url, tool_name, http_client)
+        await verify_tool_exists(server_url, tool_name, http_headers)
 
     asyncio.run(_verify())
     print(f"   ✅ Tool '{tool_name}' found")
