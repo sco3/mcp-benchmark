@@ -1,4 +1,61 @@
-```
-# GitHub workflow files should not be ignored
-# The modified file .github/workflows/test-py-and-go.yml should remain tracked
-```
+# Go binaries and build artifacts
+main
+gomcp-benchmark
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+go.work
+go.work.sum
+
+# Rust build artifacts
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.uv/
+uv.lock
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.iml
+.DS_Store
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.cache/
+
+# OS files
+Thumbs.db
