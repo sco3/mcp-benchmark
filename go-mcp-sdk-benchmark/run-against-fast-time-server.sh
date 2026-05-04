@@ -1,0 +1,1 @@
+./go-mcp-sdk-benchmark -s http://localhost:8080/http -t get_system_time
