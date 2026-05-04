@@ -413,11 +413,40 @@ body, err := readSSE(resp.Body)
 if err != nil {
 return err
 }
-if !strings.Contains(string(body), toolName) {
-return fmt.Errorf("Tool '%s' not found", toolName)
+
+// Parse the JSON response to extract tool list
+var listResponse struct {
+Result struct {
+Tools []struct {
+Name string `json:"name"`
+} `json:"tools"`
+} `json:"result"`
 }
+
+if err := json.Unmarshal(body, &listResponse); err != nil {
+return fmt.Errorf("Tool '%s' not found (failed to parse response: %v)", toolName, err)
+}
+
+// Check if the requested tool exists
+for _, tool := range listResponse.Result.Tools {
+if tool.Name == toolName {
 return nil
 }
+}
+
+// Tool not found - list all available tools
+var availableTools []string
+for _, tool := range listResponse.Result.Tools {
+availableTools = append(availableTools, tool.Name)
+}
+
+if len(availableTools) == 0 {
+return fmt.Errorf("Tool '%s' not found. No tools available.", toolName)
+}
+
+return fmt.Errorf("Tool '%s' not found. Available tools: %s", toolName, strings.Join(availableTools, ", "))
+}
+
 
 func readSSE(r io.Reader) ([]byte, error) {
 var buf bytes.Buffer
