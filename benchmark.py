@@ -2,13 +2,11 @@
 """
 MCP Streamable HTTP benchmark (Python).
 
-Matches the Go benchmark: Init, Tool/list, Tool call phases and sdk-style output.
-
 Concurrency: one OS process per virtual user (`-u`). Each process runs its own
 `asyncio.run()` for MCP async I/O.
 
-New scenario: Cyclic benchmark where each cycle is:
-  1 session.init() -> 1 list_tools() -> up to (-r) call_tool()
+Scenario: Cyclic benchmark where each cycle is:
+  1 session.init() -> 1 list_tools() -> 1 call_tool()
 Cycles repeat until total call_tool count reaches the configured (-r) runs.
 """
 
@@ -111,7 +109,7 @@ class PhaseStats:
         return self.successful_requests / self.elapsed_s
 
     def print_results(self) -> None:
-        print(f"\n📊 {self.name} Results:")
+        print(f"\n=== {self.name} Results:")
         print(
             f"   Total: {self.total_requests} requests "
             f"({self.successful_requests} success, {self.failed_requests} failed)"
@@ -140,7 +138,7 @@ class CyclicStats:
     elapsed_s: float
 
     def print_results(self) -> None:
-        print(f"\n📊 Cyclic Benchmark Results:")
+        print(f"\n=== Cyclic Benchmark Results:")
         print(f"   Total cycles: {self.total_cycles}")
         print(f"   Total operations: {self.total_inits} inits, {self.total_lists} lists, {self.total_calls} calls")
         print(f"   Elapsed: {self.elapsed_s:.2f}s")
@@ -168,7 +166,7 @@ class CyclicStats:
 
 
 def print_summary(init: PhaseStats, list_phase: PhaseStats, call: PhaseStats) -> None:
-    print("\n📈 Summary:")
+    print("\n=== Summary:")
     print(
         f"   Init:      {init.throughput():.2f} req/s,  {init.avg_latency_ms():.2f}ms avg latency"
     )
@@ -206,7 +204,7 @@ async def verify_tool_exists(
                 names = [t.name for t in result.tools]
                 if tool_name not in names:
                     print(
-                        f"\n❌ Tool '{tool_name}' not found on server",
+                        f"\nERROR: Tool '{tool_name}' not found on server",
                         file=sys.stderr,
                     )
                     print("\nAvailable tools:", file=sys.stderr)
@@ -283,7 +281,7 @@ def run_phase1_multiprocess(
 ) -> PhaseStats:
     total_requests = users * init_runs
     print(
-        f"\n🚀 Phase 1 - Init Benchmark: {users} clients × {init_runs} runs = "
+        f"\n=== Phase 1 - Init Benchmark: {users} clients x {init_runs} runs = "
         f"{total_requests} total requests"
     )
     print(f"   Server: {server_url}")
@@ -427,13 +425,13 @@ def run_phase23_multiprocess(
     call_total = users * runs
 
     print(
-        f"\n🚀 Phase 2 - Tool/list Benchmark: {users} clients × {init_runs} runs = "
+        f"\n=== Phase 2 - Tool/list Benchmark: {users} clients x {init_runs} runs = "
         f"{list_total} total requests"
     )
     print(f"   Server: {server_url}")
 
     print(
-        f"\n🚀 Phase 3 - Tool Call Benchmark: {users} clients × {runs} runs = "
+        f"\n=== Phase 3 - Tool Call Benchmark: {users} clients x {runs} runs = "
         f"{call_total} total requests"
     )
     print(f"   Server: {server_url}")
@@ -616,7 +614,7 @@ def run_cyclic_benchmark_multiprocess(
     args_json: str,
 ) -> CyclicStats:
     """Run cyclic benchmark with multiple processes."""
-    print(f"\n🚀 Cyclic Benchmark: {users} clients × {total_calls} total tool calls each")
+    print(f"\n=== Cyclic Benchmark: {users} clients x {total_calls} total tool calls each")
     print(f"   Scenario per cycle: 1 init -> 1 list_tools -> 1 call_tool")
     print(f"   Cycles repeat until {total_calls} tool calls reached")
     print(f"   Server: {server_url}")
@@ -691,58 +689,31 @@ def run_benchmark(
     tool_arguments: dict[str, Any] | None,
     args_json: str,
     http_headers: dict[str, str],
-    cyclic: bool = False,
 ) -> None:
-    print("🔌 MCP Streamable HTTP Benchmark")
+    print("=== MCP Streamable HTTP Benchmark")
     print("   Transport: Streamable HTTP")
     print(f"   Server: {server_url}")
-
-    if cyclic:
-        print(f"   Mode: Cyclic (1 init -> 1 list -> 1 call per cycle)")
-        print(f"   Users: {users}, Total tool calls per user: {tool_runs}")
-    else:
-        print(
-            f"   Users: {users}, Init runs: {init_runs}, Tool call runs: {tool_runs}"
-        )
-
+    print(f"   Mode: Cyclic (1 init -> 1 list -> 1 call per cycle)")
+    print(f"   Users: {users}, Total tool calls per user: {tool_runs}")
     print(f"   Verifying tool '{tool_name}' exists...")
 
     async def _verify() -> None:
         await verify_tool_exists(server_url, tool_name, http_headers)
 
     asyncio.run(_verify())
-    print(f"   ✅ Tool '{tool_name}' found")
+    print(f"   OK Tool '{tool_name}' found")
 
-    if cyclic:
-        # Run cyclic benchmark
-        cyclic_stats = run_cyclic_benchmark_multiprocess(
-            server_url,
-            users,
-            tool_runs,
-            tool_name,
-            tool_arguments,
-            http_headers,
-            args_json,
-        )
-        cyclic_stats.print_results()
-    else:
-        # Run original phased benchmark
-        init_stats = run_phase1_multiprocess(server_url, users, init_runs, http_headers)
-        init_stats.print_results()
-
-        list_stats, call_stats = run_phase23_multiprocess(
-            server_url,
-            users,
-            init_runs,
-            tool_runs,
-            tool_name,
-            tool_arguments,
-            http_headers,
-            args_json,
-        )
-        list_stats.print_results()
-        call_stats.print_results()
-        print_summary(init_stats, list_stats, call_stats)
+    # Run cyclic benchmark
+    cyclic_stats = run_cyclic_benchmark_multiprocess(
+        server_url,
+        users,
+        tool_runs,
+        tool_name,
+        tool_arguments,
+        http_headers,
+        args_json,
+    )
+    cyclic_stats.print_results()
 
 
 def main() -> None:
@@ -752,7 +723,7 @@ def main() -> None:
         pass  # already set (e.g. tests / embedding)
 
     parser = argparse.ArgumentParser(
-        description="MCP Streamable HTTP benchmark (matches Go / sdk-benchmark output)"
+        description="MCP Streamable HTTP benchmark - cyclic mode only"
     )
     parser.add_argument(
         "-s",
@@ -766,14 +737,7 @@ def main() -> None:
         type=int,
         default=100,
         dest="runs",
-        help="Tool call runs per user",
-    )
-    parser.add_argument(
-        "-i",
-        type=int,
-        default=0,
-        dest="init_runs",
-        help="Init and tools/list runs per user (default: same as -r)",
+        help="Tool call runs per user (total cycles)",
     )
     parser.add_argument(
         "-u",
@@ -808,22 +772,15 @@ def main() -> None:
         default=None,
         help="Shortcut for Authorization: Bearer <token>",
     )
-    parser.add_argument(
-        "--cyclic",
-        action="store_true",
-        help="Run cyclic benchmark: 1 init -> 1 list_tools -> 1 call_tool per cycle, repeat until -r calls reached",
-    )
 
     ns = parser.parse_args()
     runs: int = getattr(ns, "runs", 100)
-    init_runs_arg: int = getattr(ns, "init_runs", 0)
     users: int = getattr(ns, "users", 1)
     server_url: str = getattr(ns, "server", "http://localhost:8000/mcp")
     tool_name: str = getattr(ns, "tool", "say_hello")
     arguments_str: str = getattr(ns, "arguments", "{}")
     cli_headers: list[str] = getattr(ns, "headers", []) or []
     auth_token: str | None = getattr(ns, "auth_token", None)
-    cyclic: bool = getattr(ns, "cyclic", False)
 
     if os.environ.get("RUNS"):
         try:
@@ -832,8 +789,6 @@ def main() -> None:
                 runs = n
         except ValueError:
             pass
-
-    init_runs = init_runs_arg if init_runs_arg > 0 else runs
 
     tool_arguments: dict[str, Any] | None = None
     args_json = arguments_str.strip()
@@ -853,13 +808,12 @@ def main() -> None:
     run_benchmark(
         server_url=server_url,
         users=users,
-        init_runs=init_runs,
+        init_runs=runs,
         tool_runs=runs,
         tool_name=tool_name,
         tool_arguments=tool_arguments,
         args_json=args_json,
         http_headers=http_headers,
-        cyclic=cyclic,
     )
 
 
